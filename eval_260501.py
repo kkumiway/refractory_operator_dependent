@@ -13,11 +13,11 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
 
-HOLDOUT_PATH = Path('data/UltrasonicData_holdout.csv')
-CONFIG_PATH  = Path('models/jy_best_model.json')
-MODEL_PATH   = Path('models/trained_multimodal_best.pth')
-OUT_CSV      = Path('results/holdout_predictions.csv')
-OUT_CM       = Path('results/confusion_matrix.png')
+DATA_PATH   = Path('data/260501.xlsx')
+CONFIG_PATH = Path('models/jy_best_model.json')
+MODEL_PATH  = Path('models/trained_multimodal_best_0502.pth')
+OUT_CSV     = Path('results/260501_predictions.csv')
+OUT_CM      = Path('results/260501_confusion_matrix.png')
 
 OUT_CSV.parent.mkdir(exist_ok=True)
 
@@ -31,20 +31,26 @@ NOVERLAP = cfg['stft_config']['noverlap']
 NFFT     = cfg['stft_config']['nfft']
 WINDOW   = cfg['stft_config']['window']
 
-N_META_COLS = 5
+# xlsx 메타 컬럼 수 (0~30: 메타, 31~7962: 신호)
+N_META_COLS = 31
 BATCH_SIZE  = 32
 THRESHOLD   = 0.5
 
 
 #%% Data Loading
-df        = pd.read_csv(HOLDOUT_PATH, encoding='utf-8')
-signal_np = df.iloc[:, N_META_COLS:].values.astype(np.float32)
-labels    = df['균열유무'].values.astype(int)
+print('xlsx 로딩 중 (시간이 걸릴 수 있습니다)...')
+df        = pd.read_excel(DATA_PATH)
+signal_np = df.iloc[:, N_META_COLS:].values.astype(np.float32)   # (N, 7932)
+labels_raw = df['Label'].values   # NaN 포함
 
-print(f'hold-out: {len(df)}행  |  정상(0): {(labels==0).sum()}  균열(1): {(labels==1).sum()}')
+print(f'전체: {len(df)}행  |  신호 길이: {signal_np.shape[1]} samples')
+print(f'Label 분포 — 정상(0): {(labels_raw==0).sum():.0f}  '
+      f'균열(1): {(labels_raw==1).sum():.0f}  '
+      f'미검사(NaN): {pd.isna(labels_raw).sum()}')
+print(f'이름 종류: {df["이름"].unique().tolist()}')
 
 
-#%% Preprocessing (정규화 없음 — train_multimodal.py 현재 버전과 동일)
+#%% Preprocessing
 def to_stft_tensor(wav: np.ndarray) -> torch.Tensor:
     _, _, Zxx = stft(wav, fs=FS, nperseg=NPERSEG, noverlap=NOVERLAP,
                      nfft=NFFT, window=WINDOW)
@@ -59,27 +65,27 @@ def to_stft_tensor(wav: np.ndarray) -> torch.Tensor:
 def to_signal_tensor(wav: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(wav).unsqueeze(0)
 
-print('전처리 중...')
+print('\n전처리 중...')
 sig_tensors = [to_signal_tensor(w) for w in signal_np]
 img_tensors = [to_stft_tensor(w)   for w in signal_np]
+print('완료')
 
 
 #%% Dataset
 class MultiModalDataset(Dataset):
-    def __init__(self, sig_list, img_list, labels):
-        self.sigs   = sig_list
-        self.imgs   = img_list
-        self.labels = torch.tensor(labels, dtype=torch.long)
-    def __len__(self): return len(self.labels)
-    def __getitem__(self, idx): return self.sigs[idx], self.imgs[idx], self.labels[idx]
+    def __init__(self, sig_list, img_list):
+        self.sigs = sig_list
+        self.imgs = img_list
+    def __len__(self): return len(self.sigs)
+    def __getitem__(self, idx): return self.sigs[idx], self.imgs[idx]
 
 loader = DataLoader(
-    MultiModalDataset(sig_tensors, img_tensors, labels),
+    MultiModalDataset(sig_tensors, img_tensors),
     batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
 )
 
 
-#%% Model Definition
+#%% Model
 class Branch2D(nn.Module):
     def __init__(self):
         super().__init__()
@@ -136,74 +142,89 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model  = MultiModalModel().to(device)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
-print(f'device: {device}  |  가중치: {MODEL_PATH.name}')
+print(f'\ndevice: {device}  |  모델: {MODEL_PATH.name}')
 
 preds, probs_list = [], []
 with torch.no_grad():
-    for sig, img, _ in loader:
+    for sig, img in loader:
         sig, img = sig.to(device), img.to(device)
         probs = torch.softmax(model(sig, img), dim=1).cpu().numpy()
         probs_list.extend(probs[:, 1].tolist())
         preds.extend((probs[:, 1] >= THRESHOLD).astype(int).tolist())
 
+print(f'\n추론 완료  |  crack 예측: {sum(preds)}건 / {len(preds)}건')
 
-#%% Build Results DataFrame
-def classify(actual, pred):
-    if actual == 1 and pred == 1: return 'TP'
-    if actual == 0 and pred == 1: return 'FP'
-    if actual == 1 and pred == 0: return 'FN'
+
+#%% Results DataFrame
+def classify(label, pred):
+    if pd.isna(label): return 'Uninspected'
+    label = int(label)
+    if label == 1 and pred == 1: return 'TP'
+    if label == 0 and pred == 1: return 'FP'
+    if label == 1 and pred == 0: return 'FN'
     return 'TN'
 
-results_df = df[['제품명', '부호', '균열유무']].copy()
-results_df['예측']       = preds
+results_df = df[['이름', 'Label', '측정 번호', '날짜 & 시간']].copy()
+results_df['모델예측']   = preds
 results_df['prob_crack'] = [round(p, 4) for p in probs_list]
-results_df['result']     = [classify(a, p) for a, p in zip(labels, preds)]
+results_df['result']     = [classify(l, p) for l, p in zip(labels_raw, preds)]
 
 results_df.to_csv(OUT_CSV, index=False, encoding='utf-8-sig')
-print(f'\nCSV 저장: {OUT_CSV}')
+print(f'CSV 저장: {OUT_CSV}')
 
 
-#%% Metrics
-tp = (results_df['result'] == 'TP').sum()
-fp = (results_df['result'] == 'FP').sum()
-fn = (results_df['result'] == 'FN').sum()
-tn = (results_df['result'] == 'TN').sum()
+#%% Metrics (Label 있는 142행 기준)
+labeled = results_df[results_df['result'] != 'Uninspected']
+tp = (labeled['result'] == 'TP').sum()
+fp = (labeled['result'] == 'FP').sum()
+fn = (labeled['result'] == 'FN').sum()
+tn = (labeled['result'] == 'TN').sum()
 
-acc  = (tp + tn) / len(results_df)
+acc  = (tp + tn) / len(labeled) if len(labeled) else 0
 prec = tp / (tp + fp + 1e-9)
 rec  = tp / (tp + fn + 1e-9)
 f1   = 2 * prec * rec / (prec + rec + 1e-9)
 
-print('\n' + '=' * 40)
-print('=== Hold-out 평가 결과 ===')
-print(f'Accuracy  : {acc:.4f}  ({tp+tn}/{len(results_df)})')
-print(f'Precision : {prec:.4f}')
-print(f'Recall    : {rec:.4f}')
+print('\n' + '=' * 50)
+print('=== 파괴 검사 결과와 비교 (Label 있는 행만) ===')
+print(f'대상: {len(labeled)}행  |  실제 정상(0): {int((labeled["Label"]==0).sum())}  실제 균열(1): {int((labeled["Label"]==1).sum())}')
+print(f'\nAccuracy  : {acc:.4f}  ({tp+tn}/{len(labeled)})')
+print(f'Precision : {prec:.4f}  (crack 예측 중 실제 crack 비율)')
+print(f'Recall    : {rec:.4f}  (실제 crack 중 맞힌 비율)')
 print(f'F1(crack) : {f1:.4f}')
 print(f'\nTP={tp}  FP={fp}  FN={fn}  TN={tn}')
 
-wrong = results_df[results_df['result'].isin(['FP', 'FN'])]
+wrong = labeled[labeled['result'].isin(['FP', 'FN'])]
 if len(wrong):
     print(f'\n오분류 {len(wrong)}건:')
-    print(wrong[['제품명', '부호', '균열유무', '예측', 'prob_crack', 'result']].to_string(index=False))
+    print(wrong[['이름', 'Label', '모델예측', 'prob_crack', 'result', '날짜 & 시간']].to_string(index=False))
 
 
-#%% Confusion Matrix
-cm = [[tn, fp],
-      [fn, tp]]
+#%% Confusion Matrix (Label 있는 행)
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-fig, ax = plt.subplots(figsize=(5, 4))
-sns.heatmap(
-    cm,
-    annot=True, fmt='d', cmap='Blues',
-    xticklabels=['Predicted normal(0)', 'Predicted crack(1)'],
-    yticklabels=['Actual normal(0)', 'Actual crack(1)'],
-    ax=ax,
-)
-ax.set_title(f'Confusion Matrix  (Acc={acc:.3f}, F1={f1:.3f})', fontsize=12)
-ax.set_ylabel('Actual')
-ax.set_xlabel('Predicted')
+# ── left: vs. destructive inspection results ──────────────────────
+cm_labeled = [[tn, fp], [fn, tp]]
+sns.heatmap(cm_labeled, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Predicted Normal', 'Predicted Crack'],
+            yticklabels=['Actual Normal', 'Actual Crack'],
+            ax=axes[0])
+axes[0].set_title(f'vs. Destructive Inspection Results (n={len(labeled)})\n'
+                  f'Acc={acc:.3f}  Prec={prec:.3f}  Rec={rec:.3f}  F1={f1:.3f}',
+                  fontsize=10)
+axes[0].set_ylabel('Actual (Destructive Inspection)'); axes[0].set_xlabel('Model Prediction')
+
+# ── right: full prediction distribution ───────────────────────────
+pred_counts = results_df['result'].value_counts()
+colors = {'TP': '#2196F3', 'FP': '#FF9800', 'FN': '#F44336', 'TN': '#4CAF50', 'Uninspected': '#9E9E9E'}
+bar_colors = [colors.get(k, '#999') for k in pred_counts.index]
+axes[1].bar(pred_counts.index, pred_counts.values, color=bar_colors)
+for i, (k, v) in enumerate(pred_counts.items()):
+    axes[1].text(i, v + 10, str(v), ha='center', fontsize=10)
+axes[1].set_title(f'Full Prediction Distribution (n={len(results_df)})', fontsize=10)
+axes[1].set_ylabel('Count')
+
 plt.tight_layout()
 plt.savefig(OUT_CM, dpi=150)
 plt.show()
-print(f'Confusion matrix 저장: {OUT_CM}')
+print(f'그래프 저장: {OUT_CM}')
